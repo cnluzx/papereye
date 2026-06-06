@@ -4,23 +4,42 @@ param()
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
-
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 
 public static class Win32
 {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MAGCOLOREFFECT
+    {
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst=25)]
+        public float[] transform;
+    }
+
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_TRANSPARENT = 0x20;
     public const int WS_EX_TOOLWINDOW = 0x80;
     public const int WS_EX_NOACTIVATE = 0x08000000;
     public const int WM_HOTKEY = 0x0312;
+    public const int WM_DISPLAYCHANGE = 0x007E;
+    public const int WM_SETTINGCHANGE = 0x001A;
+    public const int WM_DPICHANGED = 0x02E0;
+
+    public const int SM_XVIRTUALSCREEN = 76;
+    public const int SM_YVIRTUALSCREEN = 77;
+    public const int SM_CXVIRTUALSCREEN = 78;
+    public const int SM_CYVIRTUALSCREEN = 79;
+
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_SHOWWINDOW = 0x0040;
 
     public const uint MOD_ALT = 0x0001;
     public const uint MOD_CONTROL = 0x0002;
     public const uint MOD_SHIFT = 0x0004;
+
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
 
     [DllImport("user32.dll", EntryPoint="GetWindowLongPtr", SetLastError=true)]
     private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
@@ -40,6 +59,27 @@ public static class Win32
     [DllImport("user32.dll", SetLastError=true)]
     public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
 
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern int GetSystemMetrics(int nIndex);
+
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetProcessDpiAwarenessContext(IntPtr dpiContext);
+
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetProcessDPIAware();
+
+    [DllImport("Magnification.dll", SetLastError=true)]
+    public static extern bool MagInitialize();
+
+    [DllImport("Magnification.dll", SetLastError=true)]
+    public static extern bool MagUninitialize();
+
+    [DllImport("Magnification.dll", SetLastError=true)]
+    public static extern bool MagSetFullscreenColorEffect(ref MAGCOLOREFFECT pEffect);
+
     public static IntPtr GetWindowLongAuto(IntPtr hWnd, int nIndex)
     {
         return IntPtr.Size == 8 ? GetWindowLongPtr64(hWnd, nIndex) : GetWindowLong32(hWnd, nIndex);
@@ -51,6 +91,26 @@ public static class Win32
     }
 }
 "@
+
+function Enable-PerMonitorDpiAwareness {
+    try {
+        if ([Win32]::SetProcessDpiAwarenessContext([Win32]::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) {
+            return
+        }
+    }
+    catch {
+    }
+
+    try {
+        [void][Win32]::SetProcessDPIAware()
+    }
+    catch {
+    }
+}
+
+Enable-PerMonitorDpiAwareness
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $script:AppName = 'PaperEye'
 $script:ConfigDir = Join-Path ([Environment]::GetFolderPath('ApplicationData')) $script:AppName
@@ -90,6 +150,14 @@ $script:WhiteCapTitleText = $null
 $script:WhiteCapDescText = $null
 $script:WhiteCapValueText = $null
 $script:WhiteCapSlider = $null
+$script:ColorKeepTitleText = $null
+$script:ColorKeepDescText = $null
+$script:ColorKeepValueText = $null
+$script:ColorKeepSlider = $null
+$script:TextContrastTitleText = $null
+$script:TextContrastDescText = $null
+$script:TextContrastValueText = $null
+$script:TextContrastSlider = $null
 $script:SettingsTitleText = $null
 $script:StartupCheckBox = $null
 $script:StartupHintText = $null
@@ -107,6 +175,10 @@ $script:MenuOpen = $null
 $script:MenuToggle = $null
 $script:MenuExit = $null
 $script:NoiseBrush = $null
+$script:OverlayHwndSource = $null
+$script:OverlayHook = $null
+$script:DisplaySettingsHandler = $null
+$script:MagnificationInitialized = $false
 $script:UiUpdating = $false
 $script:ShuttingDown = $false
 
@@ -156,15 +228,19 @@ $script:TextCatalog = @{
     'en-US' = @{
         HeroSubtitle  = 'Paper-like eye-care filter that softens white-heavy screens'
         HeroBadge     = 'Local only'
-        StatusOn      = 'Status: On | Paper {0}% | Texture {1}% | White cap {2}%'
-        StatusIdle    = 'Status: On | Paper 0% | White cap 0%'
+        StatusOn      = 'Status: On | Paper {0}% | Texture {1}% | Highlight {2}% | Keep {3}% | Text {4}%'
+        StatusIdle    = 'Status: On | Paper 0% | Highlight 0%'
         StatusOff     = 'Status: Off | Last paper {0}%'
         PaperTitle    = 'Paper feel'
         PaperDesc     = 'Warm paper tint for long reading sessions.'
         TextureTitle  = 'Texture intensity'
-        TextureDesc   = 'Fine grain control. Use 0-20% in dark rooms.'
-        WhiteCapTitle = 'Max brightness cap'
-        WhiteCapDesc  = 'Uniformly dims peak brightness so white pages feel softer.'
+        TextureDesc   = 'Dense paper noise with a few uneven speckles, fading in smoothly at low paper levels.'
+        WhiteCapTitle = 'Highlight compression'
+        WhiteCapDesc  = 'Softly compresses bright whites; color retention is controlled by a separate slider.'
+        ColorKeepTitle = 'Color retention'
+        ColorKeepDesc  = 'Separately controls how much nearby color detail is preserved during highlight compression.'
+        TextContrastTitle = 'Text contrast'
+        TextContrastDesc  = 'Improves separation between dark text and light backgrounds for reading pages and documents.'
         SettingsTitle = 'Preferences'
         StartupTitle  = 'Start with Windows'
         StartupDesc   = 'Launch PaperEye in the tray after you sign in.'
@@ -184,15 +260,19 @@ $script:TextCatalog = @{
     'zh-CN' = @{
         HeroSubtitle  = (Decode-Utf8Base64 '57G757q45oqk55y85ruk6ZWc77yM6ZmN5L2O5bGP5bmV55m95YWJ5Yi65r+A')
         HeroBadge     = (Decode-Utf8Base64 '5pys5Zyw6L+Q6KGM')
-        StatusOn      = (Decode-Utf8Base64 '54q25oCB77ya5bey5byA5ZCvIHwg57q45oSfIHswfSUgfCDnurnnkIYgezF9JSB8IOeZveiJsuWOi+mZkCB7Mn0l')
-        StatusIdle    = (Decode-Utf8Base64 '54q25oCB77ya5bey5byA5ZCvIHwg57q45oSfIDAlIHwg55m96Imy5Y6L6ZmQIDAl')
+        StatusOn      = (Decode-Utf8Base64 '54q25oCB77ya5bey5byA5ZCvIHwg57q45oSfIHswfSUgfCDnurnnkIYgezF9JSB8IOmrmOWFiSB7Mn0lIHwg5L+d55WZIHszfSUgfCDmloflrZcgezR9JQ==')
+        StatusIdle    = (Decode-Utf8Base64 '54q25oCB77ya5bey5byA5ZCvIHwg57q45oSfIDAlIHwg6auY5YWJIDAl')
         StatusOff     = (Decode-Utf8Base64 '54q25oCB77ya5bey5YWz6ZetIHwg5LiK5qyh57q45oSfIHswfSU=')
         PaperTitle    = (Decode-Utf8Base64 '57q45oSf5by65bqm')
         PaperDesc     = (Decode-Utf8Base64 '5o6n5Yi25pqW6Imy57q45byg5bqV6Imy77yM6YCC5ZCI6ZW/5pe26Ze06ZiF6K+744CC')
         TextureTitle  = (Decode-Utf8Base64 '57q555CG5by65bqm')
-        TextureDesc   = (Decode-Utf8Base64 '5o6n5Yi257uG6IW76aKX57KS5oSf77yM5L2O5Lqu546v5aKD5bu66K6uIDAtMjAl44CC')
-        WhiteCapTitle = (Decode-Utf8Base64 '5pyA5aSn5Lqu5bqm57yp6ZmQ')
-        WhiteCapDesc  = (Decode-Utf8Base64 '5Z2H5YyA5Y6L5pqX6auY5Lqu5Yy65Z+f77yM6ZmN5L2O5YWo55m96aG16Z2i5Yi655y85oSf44CC')
+        TextureDesc   = (Decode-Utf8Base64 '5o6n5Yi257uG5a+G57q46Z2i5Zmq5aOw5ZKM5bCR6YeP5LiN5Z2H5YyA5Zmq54K577yM5L2O57q45oSf5pe25Lya5bmz5ruR5reh5YWl44CC')
+        WhiteCapTitle = (Decode-Utf8Base64 '6auY5YWJ5Y6L57yp')
+        WhiteCapDesc  = (Decode-Utf8Base64 '5p+U5ZKM5Y6L57yp6auY5Lqu55m96Imy77yb5ZGo5Zu06aKc6Imy5L+d55WZ55Sx5Y2V54us5ruR5p2h5o6n5Yi244CC')
+        ColorKeepTitle = (Decode-Utf8Base64 '6aKc6Imy5L+d55WZ')
+        ColorKeepDesc  = (Decode-Utf8Base64 '5Y2V54us5o6n5Yi26auY5YWJ5Y6L57yp5pe25ZGo5Zu06aKc6Imy5bGC5qyh55qE5L+d55WZ56iL5bqm44CC')
+        TextContrastTitle = (Decode-Utf8Base64 '5paH5a2X5a+55q+U')
+        TextContrastDesc  = (Decode-Utf8Base64 '5o+Q5Y2H5rex6Imy5paH5a2X5ZKM5rWF6Imy6IOM5pmv55qE5Yy65YiG5bqm77yM6YCC5ZCI6ZiF6K+7572R6aG15ZKM5paH5qGj44CC')
         SettingsTitle = (Decode-Utf8Base64 '5YGP5aW96K6+572u')
         StartupTitle  = (Decode-Utf8Base64 '5byA5py66Ieq5ZCv5Yqo')
         StartupDesc   = (Decode-Utf8Base64 '55m75b2VIFdpbmRvd3Mg5ZCO6Ieq5Yqo5Zyo5omY55uY6L+Q6KGM44CC')
@@ -267,6 +347,8 @@ function New-DefaultState {
         LastIntensity    = 35
         TextureIntensity = 30
         WhiteCap         = 10
+        ColorKeep        = 70
+        TextContrast     = 0
         StartOnBoot      = $false
         Language         = 'zh-CN'
     }
@@ -312,6 +394,16 @@ function Load-State {
             $state.WhiteCap = Clamp-Int -Value ([int]$loadedValue) -Min 0 -Max 60
         }
 
+        $loadedValue = Get-ObjectPropertyValue -Object $loaded -Name 'ColorKeep'
+        if ($null -ne $loadedValue) {
+            $state.ColorKeep = Clamp-Int -Value ([int]$loadedValue) -Min 0 -Max 100
+        }
+
+        $loadedValue = Get-ObjectPropertyValue -Object $loaded -Name 'TextContrast'
+        if ($null -ne $loadedValue) {
+            $state.TextContrast = Clamp-Int -Value ([int]$loadedValue) -Min 0 -Max 100
+        }
+
         $loadedValue = Get-ObjectPropertyValue -Object $loaded -Name 'StartOnBoot'
         if ($null -ne $loadedValue) {
             $state.StartOnBoot = [bool]$loadedValue
@@ -343,6 +435,8 @@ function Save-State {
             LastIntensity    = [int]$script:State.LastIntensity
             TextureIntensity = [int]$script:State.TextureIntensity
             WhiteCap         = [int]$script:State.WhiteCap
+            ColorKeep        = [int]$script:State.ColorKeep
+            TextContrast     = [int]$script:State.TextContrast
             StartOnBoot      = [bool]$script:State.StartOnBoot
             Language         = [string](Normalize-Language -Language $script:State.Language)
         }
@@ -416,16 +510,39 @@ function Sync-AutoStartState {
 
 function New-NoiseBrush {
     param(
-        [int]$PixelSize = 512
+        [int]$PixelSize = 512,
+        [int]$Contrast = 34,
+        [double]$SpeckleRate = 0.018
     )
 
     $bytes = New-Object byte[] ($PixelSize * $PixelSize * 4)
     $random = [System.Random]::new()
 
     for ($y = 0; $y -lt $PixelSize; $y++) {
+        $fiber = [Math]::Sin($y / 11.0) * 2.0
+
         for ($x = 0; $x -lt $PixelSize; $x++) {
             $index = (($y * $PixelSize) + $x) * 4
-            $value = 224 + $random.Next(-8, 9)
+            $fine = ($random.NextDouble() + $random.NextDouble() + $random.NextDouble() - 1.5) * $Contrast
+            $speckleRoll = $random.NextDouble()
+            if ($speckleRoll -lt $SpeckleRate) {
+                if ($random.NextDouble() -lt 0.68) {
+                    $direction = -1.0
+                }
+                else {
+                    $direction = 1.0
+                }
+
+                $speckle = $direction * ($Contrast * (1.8 + ($random.NextDouble() * 2.4)))
+            }
+            elseif ($speckleRoll -lt 0.08) {
+                $speckle = ($random.NextDouble() - 0.5) * $Contrast * 1.4
+            }
+            else {
+                $speckle = 0.0
+            }
+
+            $value = [int][Math]::Round(132 + $fiber + $fine + $speckle)
 
             if ($value -lt 0) {
                 $value = 0
@@ -435,10 +552,23 @@ function New-NoiseBrush {
                 $value = 255
             }
 
-            $bytes[$index + 0] = [byte]$value
-            $bytes[$index + 1] = [byte]$value
-            $bytes[$index + 2] = [byte]$value
-            $bytes[$index + 3] = 255
+            if ($value -lt 132) {
+                $red = 72
+                $green = 69
+                $blue = 62
+                $alpha = 132 - $value
+            }
+            else {
+                $red = 255
+                $green = 252
+                $blue = 240
+                $alpha = $value - 132
+            }
+
+            $bytes[$index + 0] = [byte]$blue
+            $bytes[$index + 1] = [byte]$green
+            $bytes[$index + 2] = [byte]$red
+            $bytes[$index + 3] = [byte][Math]::Min(64, $alpha)
         }
     }
 
@@ -455,6 +585,9 @@ function New-NoiseBrush {
     $bitmap.Freeze()
 
     $brush = [System.Windows.Media.ImageBrush]::new($bitmap)
+    $brush.TileMode = [System.Windows.Media.TileMode]::Tile
+    $brush.ViewportUnits = [System.Windows.Media.BrushMappingMode]::Absolute
+    $brush.Viewport = [System.Windows.Rect]::new(0, 0, $PixelSize, $PixelSize)
     $brush.Stretch = [System.Windows.Media.Stretch]::Fill
     $brush.AlignmentX = [System.Windows.Media.AlignmentX]::Center
     $brush.AlignmentY = [System.Windows.Media.AlignmentY]::Center
@@ -463,15 +596,152 @@ function New-NoiseBrush {
     return $brush
 }
 
+function New-WhiteCapBrush {
+    param(
+        [Parameter(Mandatory)]
+        [int]$Value,
+        [int]$ColorKeep = 70
+    )
+
+    $normalized = [Math]::Max(0.0, [Math]::Min(1.0, $Value / 60.0))
+    if ($normalized -le 0.0) {
+        $brush = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.Color]::FromArgb(0, 0, 0, 0))
+        $brush.Freeze()
+        return $brush
+    }
+
+    # Start from zero opacity so the first few slider steps do not pop in as a visible veil.
+    $eased = [Math]::Pow($normalized, 1.55)
+    $keepLevel = [Math]::Max(0.0, [Math]::Min(1.0, $ColorKeep / 100.0))
+    $opacity = (0.42 - (0.12 * $keepLevel)) * $eased
+
+    if ($opacity -gt 0.42) {
+        $opacity = 0.42
+    }
+
+    $alpha = [byte]([Math]::Round(255 * $opacity))
+    $red = [byte][Math]::Round(42 + (74 * $keepLevel))
+    $green = [byte][Math]::Round(42 + (58 * $keepLevel))
+    $blue = [byte][Math]::Round(42 + (34 * $keepLevel))
+    $color = [System.Windows.Media.Color]::FromArgb($alpha, $red, $green, $blue)
+    $brush = [System.Windows.Media.SolidColorBrush]::new($color)
+    $brush.Freeze()
+
+    return $brush
+}
+
+function New-MagColorEffect {
+    param(
+        [Parameter(Mandatory)]
+        [float[]]$Values
+    )
+
+    $effect = [Win32+MAGCOLOREFFECT]::new()
+    $effect.transform = New-Object float[] 25
+
+    for ($index = 0; $index -lt 25; $index++) {
+        $effect.transform[$index] = $Values[$index]
+    }
+
+    return $effect
+}
+
+function Reset-TextContrast {
+    if (-not $script:MagnificationInitialized) {
+        return
+    }
+
+    try {
+        $identity = New-MagColorEffect -Values @(
+            1, 0, 0, 0, 0,
+            0, 1, 0, 0, 0,
+            0, 0, 1, 0, 0,
+            0, 0, 0, 1, 0,
+            0, 0, 0, 0, 1
+        )
+        [void][Win32]::MagSetFullscreenColorEffect([ref]$identity)
+    }
+    catch {
+    }
+}
+
+function Apply-TextContrast {
+    param(
+        [Parameter(Mandatory)]
+        [int]$Value
+    )
+
+    $level = [Math]::Max(0.0, [Math]::Min(1.0, $Value / 100.0))
+
+    if ($level -le 0.0) {
+        Reset-TextContrast
+        return
+    }
+
+    if (-not $script:MagnificationInitialized) {
+        try {
+            $script:MagnificationInitialized = [Win32]::MagInitialize()
+        }
+        catch {
+            $script:MagnificationInitialized = $false
+        }
+    }
+
+    if (-not $script:MagnificationInitialized) {
+        return
+    }
+
+    $contrast = 1.0 + (0.34 * $level)
+    $offset = (1.0 - $contrast) / 2.0
+
+    try {
+        $effect = New-MagColorEffect -Values @(
+            $contrast, 0, 0, 0, 0,
+            0, $contrast, 0, 0, 0,
+            0, 0, $contrast, 0, 0,
+            0, 0, 0, 1, 0,
+            $offset, $offset, $offset, 0, 1
+        )
+        [void][Win32]::MagSetFullscreenColorEffect([ref]$effect)
+    }
+    catch {
+    }
+}
+
 function Update-OverlayBounds {
     if (-not $script:OverlayWindow) {
         return
     }
 
-    $script:OverlayWindow.Left = [System.Windows.SystemParameters]::VirtualScreenLeft
-    $script:OverlayWindow.Top = [System.Windows.SystemParameters]::VirtualScreenTop
-    $script:OverlayWindow.Width = [System.Windows.SystemParameters]::VirtualScreenWidth
-    $script:OverlayWindow.Height = [System.Windows.SystemParameters]::VirtualScreenHeight
+    $left = [Win32]::GetSystemMetrics([Win32]::SM_XVIRTUALSCREEN)
+    $top = [Win32]::GetSystemMetrics([Win32]::SM_YVIRTUALSCREEN)
+    $width = [Win32]::GetSystemMetrics([Win32]::SM_CXVIRTUALSCREEN)
+    $height = [Win32]::GetSystemMetrics([Win32]::SM_CYVIRTUALSCREEN)
+
+    if ($width -le 0 -or $height -le 0) {
+        return
+    }
+
+    $helper = [System.Windows.Interop.WindowInteropHelper]::new($script:OverlayWindow)
+    $handle = $helper.Handle
+
+    if ($handle -ne [IntPtr]::Zero) {
+        [void][Win32]::SetWindowPos(
+            $handle,
+            [Win32]::HWND_TOPMOST,
+            $left,
+            $top,
+            $width,
+            $height,
+            [Win32]::SWP_NOACTIVATE -bor [Win32]::SWP_SHOWWINDOW
+        )
+        return
+    }
+
+    $script:OverlayWindow.Left = $left
+    $script:OverlayWindow.Top = $top
+    $script:OverlayWindow.Width = $width
+    $script:OverlayWindow.Height = $height
 }
 
 function Set-ClickThrough {
@@ -491,6 +761,82 @@ function Set-ClickThrough {
     $style = [int64]$current.ToInt64()
     $style = $style -bor [Win32]::WS_EX_TRANSPARENT -bor [Win32]::WS_EX_TOOLWINDOW -bor [Win32]::WS_EX_NOACTIVATE
     [void][Win32]::SetWindowLongAuto($handle, [Win32]::GWL_EXSTYLE, [IntPtr]::new($style))
+}
+
+function Queue-OverlayBoundsUpdate {
+    if (-not $script:OverlayWindow) {
+        return
+    }
+
+    [void]$script:OverlayWindow.Dispatcher.BeginInvoke(
+        [Action]{
+            Update-OverlayBounds
+        },
+        [System.Windows.Threading.DispatcherPriority]::ApplicationIdle
+    )
+}
+
+function Register-OverlaySystemHooks {
+    if (-not $script:OverlayWindow) {
+        return
+    }
+
+    $helper = [System.Windows.Interop.WindowInteropHelper]::new($script:OverlayWindow)
+    if ($helper.Handle -eq [IntPtr]::Zero) {
+        return
+    }
+
+    $script:OverlayHwndSource = [System.Windows.Interop.HwndSource]::FromHwnd($helper.Handle)
+    $script:OverlayHook = [System.Windows.Interop.HwndSourceHook]{
+        param(
+            [IntPtr]$hwnd,
+            [int]$msg,
+            [IntPtr]$wParam,
+            [IntPtr]$lParam,
+            [ref]$handled
+        )
+
+        if ($msg -eq [Win32]::WM_DPICHANGED -or
+            $msg -eq [Win32]::WM_DISPLAYCHANGE -or
+            $msg -eq [Win32]::WM_SETTINGCHANGE) {
+            Queue-OverlayBoundsUpdate
+        }
+
+        return [IntPtr]::Zero
+    }
+
+    if ($script:OverlayHwndSource) {
+        $script:OverlayHwndSource.AddHook($script:OverlayHook)
+    }
+
+    $script:DisplaySettingsHandler = [System.EventHandler]{
+        param($sender, $eventArgs)
+
+        Queue-OverlayBoundsUpdate
+    }
+    [Microsoft.Win32.SystemEvents]::add_DisplaySettingsChanged($script:DisplaySettingsHandler)
+}
+
+function Unregister-OverlaySystemHooks {
+    try {
+        if ($script:OverlayHwndSource -and $script:OverlayHook) {
+            $script:OverlayHwndSource.RemoveHook($script:OverlayHook)
+        }
+    }
+    catch {
+    }
+
+    try {
+        if ($script:DisplaySettingsHandler) {
+            [Microsoft.Win32.SystemEvents]::remove_DisplaySettingsChanged($script:DisplaySettingsHandler)
+        }
+    }
+    catch {
+    }
+
+    $script:OverlayHwndSource = $null
+    $script:OverlayHook = $null
+    $script:DisplaySettingsHandler = $null
 }
 
 function Register-HotKeys {
@@ -583,6 +929,22 @@ function Apply-Language {
         $script:WhiteCapDescText.Text = Get-Text -Key 'WhiteCapDesc'
     }
 
+    if ($script:ColorKeepTitleText) {
+        $script:ColorKeepTitleText.Text = Get-Text -Key 'ColorKeepTitle'
+    }
+
+    if ($script:ColorKeepDescText) {
+        $script:ColorKeepDescText.Text = Get-Text -Key 'ColorKeepDesc'
+    }
+
+    if ($script:TextContrastTitleText) {
+        $script:TextContrastTitleText.Text = Get-Text -Key 'TextContrastTitle'
+    }
+
+    if ($script:TextContrastDescText) {
+        $script:TextContrastDescText.Text = Get-Text -Key 'TextContrastDesc'
+    }
+
     if ($script:SettingsTitleText) {
         $script:SettingsTitleText.Text = Get-Text -Key 'SettingsTitle'
     }
@@ -612,7 +974,13 @@ function Apply-Language {
     }
 
     if ($script:LanguageCombo) {
-        $targetItem = if ($language -eq 'en-US') { $script:LanguageEnItem } else { $script:LanguageZhItem }
+        if ($language -eq 'en-US') {
+            $targetItem = $script:LanguageEnItem
+        }
+        else {
+            $targetItem = $script:LanguageZhItem
+        }
+
         if ($script:LanguageCombo.SelectedItem -ne $targetItem) {
             $script:LanguageCombo.SelectedItem = $targetItem
         }
@@ -651,17 +1019,17 @@ function Update-TrayText {
     $paperOn = [bool]($script:State.Enabled -and $script:State.Intensity -gt 0)
     $capOn = [bool]($script:State.Enabled -and $script:State.WhiteCap -gt 0)
 
-    $mode = if ($paperOn -or $capOn) {
-        'On'
+    if ($paperOn -or $capOn) {
+        $mode = 'On'
     }
     elseif ($script:State.Enabled) {
-        'On 0%'
+        $mode = 'On 0%'
     }
     else {
-        'Off'
+        $mode = 'Off'
     }
 
-    $script:TrayIcon.Text = "PaperEye $mode P$($script:State.Intensity)% T$($script:State.TextureIntensity)% W$($script:State.WhiteCap)%"
+    $script:TrayIcon.Text = "PaperEye $mode P$($script:State.Intensity)% T$($script:State.TextureIntensity)% H$($script:State.WhiteCap)% C$($script:State.TextContrast)%"
 }
 
 function Update-VisualState {
@@ -676,27 +1044,51 @@ function Update-VisualState {
         $script:State.Intensity = $intensity
         $textureIntensity = Clamp-Int -Value ([int]$script:State.TextureIntensity) -Min 0 -Max 100
         $whiteCap = Clamp-Int -Value ([int]$script:State.WhiteCap) -Min 0 -Max 60
+        $colorKeep = Clamp-Int -Value ([int]$script:State.ColorKeep) -Min 0 -Max 100
+        $textContrast = Clamp-Int -Value ([int]$script:State.TextContrast) -Min 0 -Max 100
         $script:State.TextureIntensity = $textureIntensity
         $script:State.WhiteCap = $whiteCap
+        $script:State.ColorKeep = $colorKeep
+        $script:State.TextContrast = $textContrast
 
         if ($intensity -gt 0) {
             $script:State.LastIntensity = $intensity
         }
 
         $level = $intensity / 100.0
+        if ($level -gt 0.0) {
+            $paperRamp = [Math]::Pow($level, 1.45)
+        }
+        else {
+            $paperRamp = 0.0
+        }
+
         $textureLevel = $textureIntensity / 100.0
-        $whiteCapLevel = $whiteCap / 100.0
+        if ($level -gt 0.0) {
+            $textureRamp = [Math]::Pow([Math]::Min(1.0, $level / 0.18), 1.65)
+        }
+        else {
+            $textureRamp = 0.0
+        }
+
         $paperActive = [bool]($script:State.Enabled -and $intensity -gt 0)
         $capActive = [bool]($script:State.Enabled -and $whiteCap -gt 0)
-        $active = [bool]($paperActive -or $capActive)
+        $textContrastActive = [bool]($script:State.Enabled -and $textContrast -gt 0)
+        $overlayActive = [bool]($paperActive -or $capActive)
+        $active = [bool]($overlayActive -or $textContrastActive)
         $uniformMode = $level -lt 0.22
-        $paperBaseAlpha = [byte]([Math]::Round(10 + (40 * $level)))
+        if ($paperActive) {
+            $paperBaseAlpha = [byte]([Math]::Round(1 + (51 * $paperRamp)))
+        }
+        else {
+            $paperBaseAlpha = [byte]0
+        }
 
         Apply-Language
 
         if ($script:MainWindow) {
             if ($paperActive -or $capActive) {
-                $script:MainWindow.Title = "PaperEye P$intensity% W$whiteCap%"
+                $script:MainWindow.Title = "PaperEye P$intensity% H$whiteCap%"
             }
             elseif ($script:State.Enabled) {
                 $script:MainWindow.Title = 'PaperEye 0%'
@@ -708,7 +1100,7 @@ function Update-VisualState {
 
         if ($script:StatusText) {
             if ($active) {
-                $script:StatusText.Text = Format-Text -Key 'StatusOn' -Args @($intensity, $textureIntensity, $whiteCap)
+                $script:StatusText.Text = Format-Text -Key 'StatusOn' -Args @($intensity, $textureIntensity, $whiteCap, $colorKeep, $textContrast)
             }
             elseif ($script:State.Enabled) {
                 $script:StatusText.Text = Get-Text -Key 'StatusIdle'
@@ -730,8 +1122,21 @@ function Update-VisualState {
             $script:WhiteCapValueText.Text = "$whiteCap%"
         }
 
+        if ($script:ColorKeepValueText) {
+            $script:ColorKeepValueText.Text = "$colorKeep%"
+        }
+
+        if ($script:TextContrastValueText) {
+            $script:TextContrastValueText.Text = "$textContrast%"
+        }
+
         if ($script:ToggleButton) {
-            $script:ToggleButton.Content = if ($script:State.Enabled) { Get-Text -Key 'ToggleOn' } else { Get-Text -Key 'ToggleOff' }
+            if ($script:State.Enabled) {
+                $script:ToggleButton.Content = Get-Text -Key 'ToggleOn'
+            }
+            else {
+                $script:ToggleButton.Content = Get-Text -Key 'ToggleOff'
+            }
         }
 
         if ($script:IntensitySlider) {
@@ -755,6 +1160,27 @@ function Update-VisualState {
             }
         }
 
+        if ($script:ColorKeepSlider) {
+            $sliderValue = [int][Math]::Round($script:ColorKeepSlider.Value)
+            if ($sliderValue -ne $colorKeep) {
+                $script:ColorKeepSlider.Value = $colorKeep
+            }
+        }
+
+        if ($script:TextContrastSlider) {
+            $sliderValue = [int][Math]::Round($script:TextContrastSlider.Value)
+            if ($sliderValue -ne $textContrast) {
+                $script:TextContrastSlider.Value = $textContrast
+            }
+        }
+
+        if ($textContrastActive) {
+            Apply-TextContrast -Value $textContrast
+        }
+        else {
+            Reset-TextContrast
+        }
+
         if ($script:StartupCheckBox) {
             $checked = [bool]$script:StartupCheckBox.IsChecked
             if ($checked -ne [bool]$script:State.StartOnBoot) {
@@ -763,7 +1189,7 @@ function Update-VisualState {
         }
 
         if ($script:OverlayWindow) {
-            if ($active) {
+            if ($overlayActive) {
                 Update-OverlayBounds
 
                 if (-not $script:OverlayWindow.IsVisible) {
@@ -782,7 +1208,7 @@ function Update-VisualState {
 
                         if ($script:OverlayNoiseLayer) {
                             $script:OverlayNoiseLayer.Fill = $script:NoiseBrush
-                            $script:OverlayNoiseLayer.Opacity = 0.008 * $textureLevel
+                            $script:OverlayNoiseLayer.Opacity = 0.22 * $textureLevel * $textureRamp
                         }
                     }
                     else {
@@ -814,7 +1240,7 @@ function Update-VisualState {
                         if ($script:OverlayNoiseLayer) {
                             $script:OverlayNoiseLayer.Fill = $script:NoiseBrush
                             $grainLevel = [Math]::Max(0.0, [Math]::Min(1.0, ($level - 0.22) / 0.78))
-                            $script:OverlayNoiseLayer.Opacity = (0.004 + (0.055 * [Math]::Pow($grainLevel, 1.35))) * $textureLevel
+                            $script:OverlayNoiseLayer.Opacity = (0.18 + (0.18 * [Math]::Pow($grainLevel, 1.05))) * $textureLevel
                         }
                     }
                 }
@@ -832,11 +1258,14 @@ function Update-VisualState {
                 }
 
                 if ($script:OverlayWhiteCapLayer) {
-                    $capAlpha = if ($capActive) { [byte]([Math]::Round(255 * $whiteCapLevel)) } else { [byte]0 }
-                    $capColor = [System.Windows.Media.Color]::FromArgb($capAlpha, 0, 0, 0)
-                    $capBrush = [System.Windows.Media.SolidColorBrush]::new($capColor)
-                    $capBrush.Freeze()
-                    $script:OverlayWhiteCapLayer.Fill = $capBrush
+                    if ($capActive) {
+                        $whiteCapBrushValue = $whiteCap
+                    }
+                    else {
+                        $whiteCapBrushValue = 0
+                    }
+
+                    $script:OverlayWhiteCapLayer.Fill = New-WhiteCapBrush -Value $whiteCapBrushValue -ColorKeep $colorKeep
                 }
 
                 $script:OverlayWindow.Visibility = [System.Windows.Visibility]::Visible
@@ -929,6 +1358,22 @@ function Request-Shutdown {
     }
 
     try {
+        Unregister-OverlaySystemHooks
+    }
+    catch {
+    }
+
+    try {
+        Reset-TextContrast
+        if ($script:MagnificationInitialized) {
+            [void][Win32]::MagUninitialize()
+            $script:MagnificationInitialized = $false
+        }
+    }
+    catch {
+    }
+
+    try {
         if ($script:TrayIcon) {
             $script:TrayIcon.Visible = $false
             $script:TrayIcon.Dispose()
@@ -953,7 +1398,7 @@ function Request-Shutdown {
 
 $script:State = Load-State
 Sync-AutoStartState
-$script:NoiseBrush = New-NoiseBrush -PixelSize 512
+$script:NoiseBrush = New-NoiseBrush -PixelSize 512 -Contrast 34 -SpeckleRate 0.018
 
 $overlayXaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
@@ -1182,7 +1627,7 @@ $mainXaml = @'
                                                    FontWeight="SemiBold" />
                                         <TextBlock x:Name="TextureDescText"
                                                    Margin="0,4,18,0"
-                                                   Text="Fine grain control. Use 0-20% in dark rooms."
+                                                   Text="Dense paper noise with a few uneven speckles, fading in smoothly at low paper levels."
                                                    Foreground="#8F775D"
                                                    TextWrapping="Wrap" />
                                     </StackPanel>
@@ -1227,13 +1672,13 @@ $mainXaml = @'
 
                                     <StackPanel Grid.Column="0">
                                         <TextBlock x:Name="WhiteCapTitleText"
-                                                   Text="Max brightness cap"
+                                                   Text="Highlight compression"
                                                    Foreground="#2E261D"
                                                    FontSize="15"
                                                    FontWeight="SemiBold" />
                                         <TextBlock x:Name="WhiteCapDescText"
                                                    Margin="0,4,18,0"
-                                                   Text="Uniformly dims peak brightness so white pages feel softer."
+                                                   Text="Softly compresses bright whites; color retention is controlled by a separate slider."
                                                    Foreground="#8F775D"
                                                    TextWrapping="Wrap" />
                                     </StackPanel>
@@ -1260,6 +1705,108 @@ $mainXaml = @'
                                         SmallChange="1"
                                         LargeChange="5"
                                         Value="10" />
+                            </Grid>
+                        </Border>
+
+                        <Border Style="{StaticResource CardBorder}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Grid.Row="0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock x:Name="ColorKeepTitleText"
+                                                   Text="Color retention"
+                                                   Foreground="#2E261D"
+                                                   FontSize="15"
+                                                   FontWeight="SemiBold" />
+                                        <TextBlock x:Name="ColorKeepDescText"
+                                                   Margin="0,4,18,0"
+                                                   Text="Separately controls how much nearby color detail is preserved during highlight compression."
+                                                   Foreground="#8F775D"
+                                                   TextWrapping="Wrap" />
+                                    </StackPanel>
+
+                                    <Border Grid.Column="1"
+                                            Background="#FFE8DED0"
+                                            CornerRadius="13"
+                                            Padding="12,6"
+                                            VerticalAlignment="Top">
+                                        <TextBlock x:Name="ColorKeepValueText"
+                                                   Text="70%"
+                                                   Foreground="#6A4827"
+                                                   FontWeight="Bold" />
+                                    </Border>
+                                </Grid>
+
+                                <Slider x:Name="ColorKeepSlider"
+                                        Grid.Row="1"
+                                        Margin="0,14,0,0"
+                                        Minimum="0"
+                                        Maximum="100"
+                                        TickFrequency="1"
+                                        IsSnapToTickEnabled="True"
+                                        SmallChange="1"
+                                        LargeChange="5"
+                                        Value="70" />
+                            </Grid>
+                        </Border>
+
+                        <Border Style="{StaticResource CardBorder}">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Grid.Row="0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+
+                                    <StackPanel Grid.Column="0">
+                                        <TextBlock x:Name="TextContrastTitleText"
+                                                   Text="Text contrast"
+                                                   Foreground="#2E261D"
+                                                   FontSize="15"
+                                                   FontWeight="SemiBold" />
+                                        <TextBlock x:Name="TextContrastDescText"
+                                                   Margin="0,4,18,0"
+                                                   Text="Improves separation between dark text and light backgrounds for reading pages and documents."
+                                                   Foreground="#8F775D"
+                                                   TextWrapping="Wrap" />
+                                    </StackPanel>
+
+                                    <Border Grid.Column="1"
+                                            Background="#FFE8DED0"
+                                            CornerRadius="13"
+                                            Padding="12,6"
+                                            VerticalAlignment="Top">
+                                        <TextBlock x:Name="TextContrastValueText"
+                                                   Text="0%"
+                                                   Foreground="#6A4827"
+                                                   FontWeight="Bold" />
+                                    </Border>
+                                </Grid>
+
+                                <Slider x:Name="TextContrastSlider"
+                                        Grid.Row="1"
+                                        Margin="0,14,0,0"
+                                        Minimum="0"
+                                        Maximum="100"
+                                        TickFrequency="1"
+                                        IsSnapToTickEnabled="True"
+                                        SmallChange="1"
+                                        LargeChange="5"
+                                        Value="0" />
                             </Grid>
                         </Border>
 
@@ -1372,6 +1919,14 @@ $script:WhiteCapTitleText = $script:MainWindow.FindName('WhiteCapTitleText')
 $script:WhiteCapDescText = $script:MainWindow.FindName('WhiteCapDescText')
 $script:WhiteCapValueText = $script:MainWindow.FindName('WhiteCapValueText')
 $script:WhiteCapSlider = $script:MainWindow.FindName('WhiteCapSlider')
+$script:ColorKeepTitleText = $script:MainWindow.FindName('ColorKeepTitleText')
+$script:ColorKeepDescText = $script:MainWindow.FindName('ColorKeepDescText')
+$script:ColorKeepValueText = $script:MainWindow.FindName('ColorKeepValueText')
+$script:ColorKeepSlider = $script:MainWindow.FindName('ColorKeepSlider')
+$script:TextContrastTitleText = $script:MainWindow.FindName('TextContrastTitleText')
+$script:TextContrastDescText = $script:MainWindow.FindName('TextContrastDescText')
+$script:TextContrastValueText = $script:MainWindow.FindName('TextContrastValueText')
+$script:TextContrastSlider = $script:MainWindow.FindName('TextContrastSlider')
 $script:SettingsTitleText = $script:MainWindow.FindName('SettingsTitleText')
 $script:StartupCheckBox = $script:MainWindow.FindName('StartupCheckBox')
 $script:StartupHintText = $script:MainWindow.FindName('StartupHintText')
@@ -1390,6 +1945,7 @@ $script:App.ShutdownMode = [System.Windows.ShutdownMode]::OnExplicitShutdown
 
 $script:OverlayWindow.Add_SourceInitialized({
     Set-ClickThrough -Window $script:OverlayWindow
+    Register-OverlaySystemHooks
     Update-OverlayBounds
 })
 
@@ -1535,6 +2091,26 @@ $script:WhiteCapSlider.Add_ValueChanged({
         $script:State.Enabled = $true
     }
 
+    Update-VisualState
+})
+
+$script:ColorKeepSlider.Add_ValueChanged({
+    if ($script:UiUpdating) {
+        return
+    }
+
+    $newValue = [int][Math]::Round($script:ColorKeepSlider.Value)
+    $script:State.ColorKeep = Clamp-Int -Value $newValue -Min 0 -Max 100
+    Update-VisualState
+})
+
+$script:TextContrastSlider.Add_ValueChanged({
+    if ($script:UiUpdating) {
+        return
+    }
+
+    $newValue = [int][Math]::Round($script:TextContrastSlider.Value)
+    $script:State.TextContrast = Clamp-Int -Value $newValue -Min 0 -Max 100
     Update-VisualState
 })
 
